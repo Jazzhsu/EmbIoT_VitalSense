@@ -34,7 +34,7 @@
 ********************************************************************************/
 #define USB_CONFIG_DELAY          (50U) /* In milliseconds */
 
-#define FIFO_BUF_SIZE 256 /* read 256 samples from radar FIFO every time */
+#define CHUNK_SIZE 128 /* read 128 samples from radar FIFO every time */
 
 #define XENSIV_BGT60TRXX_SPI_FREQUENCY      (25000000UL)
 
@@ -45,10 +45,9 @@
 
 #define MAGIC (0xFFDDFFDD)
 
-struct __attribute__((packed)) com_buf {
+struct __attribute__((packed)) hdr {
     uint32_t magic;
     uint32_t length;
-    uint16 samples[NUM_SAMPLES_PER_FRAME];
 };
 
 /*******************************************************************************
@@ -81,8 +80,9 @@ static xensiv_bgt60trxx_mtb_t sensor;
 static volatile bool data_available = false;
 
 /* Allocate enough memory for the radar dara frame. */
-static struct com_buf buf = { .magic = MAGIC, .length = NUM_SAMPLES_PER_FRAME * 2 };
-// static uint16_t samples[NUM_SAMPLES_PER_FRAME + 1];
+static struct hdr header = { .magic = MAGIC, .length = CHUNK_SIZE * 2 };
+
+static uint8_t tx_buffer[sizeof(struct hdr) + CHUNK_SIZE * 2];
 
 /* Interrupt handler to react on sensor indicating the availability of new data */
 void xensiv_bgt60trxx_mtb_interrupt_handler(void *args, cyhal_gpio_event_t event) {
@@ -133,6 +133,10 @@ int main(void) {
     USBD_SetDeviceInfo(&usb_deviceInfo);
     USBD_Start();
 
+    while ((USBD_GetState() & USB_STAT_CONFIGURED) != USB_STAT_CONFIGURED) {
+        cyhal_system_delay_ms(USB_CONFIG_DELAY);
+    }
+
     /********************************************************************************
     * Radar Setup
     ********************************************************************************/
@@ -177,7 +181,7 @@ int main(void) {
     /* The sensor will generate an interrupt once the sensor FIFO level is
        NUM_SAMPLES_PER_FRAME */
     result = xensiv_bgt60trxx_mtb_interrupt_init(&sensor,
-                                                 FIFO_BUF_SIZE,
+                                                 CHUNK_SIZE,
                                                  PIN_XENSIV_BGT60TRXX_IRQ,
                                                  CYHAL_ISR_PRIORITY_DEFAULT,
                                                  xensiv_bgt60trxx_mtb_interrupt_handler,
@@ -193,43 +197,35 @@ int main(void) {
 
     cyhal_gpio_write(CYBSP_USER_LED, CYBSP_LED_STATE_ON);
 
-    uint32_t frame_idx = 0;
+    memcpy(tx_buffer, &header, sizeof(header));
 
     for (;;) {
-        printf("reading radar..\r\n");
+        // printf("reading radar..\r\n");
         // Wait for radar fifo data
-        uint32_t samples_read = 0;
-        while (samples_read < NUM_SAMPLES_PER_FRAME) {
+        int result = 0;
+        do {
             while (data_available == false);
             data_available = false;
-            int result = xensiv_bgt60trxx_get_fifo_data(&sensor.dev, buf.samples + samples_read, FIFO_BUF_SIZE);
-            if (result == XENSIV_BGT60TRXX_STATUS_OK) {
-                samples_read += FIFO_BUF_SIZE;
-            }
-            
+            int result = xensiv_bgt60trxx_get_fifo_data(&sensor.dev, (uint16_t *)(tx_buffer + sizeof(struct hdr)), CHUNK_SIZE);
+
+            // restart the radar if FIDO overflows.
             if (result == XENSIV_BGT60TRXX_STATUS_GSR0_ERROR) {
+                printf("restarting radar..\r\n");
                 xensiv_bgt60trxx_soft_reset(&sensor.dev, XENSIV_BGT60TRXX_RESET_FIFO);
                 xensiv_bgt60trxx_start_frame(&sensor.dev, false);
                 xensiv_bgt60trxx_start_frame(&sensor.dev, true);
-                samples_read = 0;
                 data_available = false;
-                continue;
             }
-        }
 
-        printf("waiting usb..\r\n");
+        } while (result != XENSIV_BGT60TRXX_STATUS_OK);
 
-        while ((USBD_GetState() & USB_STAT_CONFIGURED) != USB_STAT_CONFIGURED) {
-            cyhal_system_delay_ms(USB_CONFIG_DELAY);
-        }
+        // printf("waiting usb..\r\n");
 
         // |samples| is uint16_t array, we need to write as byte streams, therefore size
         // should be N_SAMPLES * 2
-        printf("writing... %hu %hu\r\n", buf.samples[0], buf.samples[NUM_SAMPLES_PER_FRAME - 1]);
-        USBD_CDC_Write(usb_cdcHandle, &buf, sizeof(buf), 0);
+        // printf("writing... %hu %hu\r\n", ((uint16_t *)tx_buffer)[4], ((uint16_t *)tx_buffer)[4 + CHUNK_SIZE - 1]);
+        USBD_CDC_Write(usb_cdcHandle, &tx_buffer, sizeof(tx_buffer), 0);
         USBD_CDC_WaitForTX(usb_cdcHandle, 0);
-
-        ++frame_idx;
     }
 }
 

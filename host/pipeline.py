@@ -1,18 +1,27 @@
 import numpy as np
-from scipy.signal import butter, sosfiltfilt
+from scipy.signal import butter, sosfilt, sosfilt_zi
 
 class Pipeline:
-    def __init__(self, sample_per_chirp: int, chirp_per_frame: int, buffer_size: int, bin_os: int = 5,
-                 prt: float = 5e-3, f_center=60.5e9):
+    def __init__(
+        self, 
+        sample_per_chirp: int,
+        buffer_size: int,
+        window_size: int,
+        stride: int,
+        bin_os: int = 5,
+        prt: float = 5e-3,
+        f_center=60.5e9
+    ):
         # 1 frame = sample_per_chirp x chirp_per_frame
         self._sample_per_chirp = sample_per_chirp
-        self._chirp_per_frame = chirp_per_frame
-        self._buffer_size = buffer_size  # number of frames we hold
+        self._buffer_size = buffer_size  # number of chirps we hold
+        self._window_size = window_size
+        self._stride = stride
         self._range_fft_size = sample_per_chirp
         self._bin_os = bin_os
 
-        self._data = np.zeros((buffer_size * chirp_per_frame, sample_per_chirp), dtype=np.float32)
-        self._n_frames = 0
+        self._data = np.zeros((buffer_size, sample_per_chirp), dtype=np.float32)
+        self._n_chirp = 0
 
         # Matches Matlab: 2 * blackman(samples_per_chirp)
         self._window = (2.0 * np.blackman(sample_per_chirp)).astype(np.float32)
@@ -27,27 +36,34 @@ class Pipeline:
 
         self._sos_breath = butter(4, [0.1, 0.5], btype="bandpass",
                                 fs=self._fs, output="sos")
-        self._sos_heart  = butter(4, [0.75, 3.0], btype="bandpass",
+        self._sos_heart  = butter(4, [0.9, 2.0], btype="bandpass",
                                 fs=self._fs, output="sos")
+        
+        self._breath_zi = None
+        self._heart_zi  = None
+        self._filt_breath = np.zeros(window_size, dtype=np.float64)
+        self._filt_heart  = np.zeros(window_size, dtype=np.float64)
 
     def data_ready(self):
-        return self._n_frames >= self._buffer_size
+        return self._n_chirp >= self._window_size and self._n_chirp % self._stride == 0
 
     def enque(self, data: list):
-        assert len(data) == self._sample_per_chirp * self._chirp_per_frame, "size of the data doesn't match"
-        frame = np.array(data).reshape((self._chirp_per_frame, self._sample_per_chirp))
+        assert len(data) == self._sample_per_chirp, "size of the data doesn't match"
+        
+        if self._n_chirp == self._buffer_size:
+            self._data[:self._window_size, :] = self._data[-self._window_size:, :]
+            self._n_chirp = self._window_size
 
-        # shift the data up
-        self._data[:-self._chirp_per_frame, :] = self._data[self._chirp_per_frame:, :]
+        for i in range(self._sample_per_chirp):
+            self._data[self._n_chirp, i] = data[i]
 
-        # enque the latest frame
-        self._data[-self._chirp_per_frame:, :] = frame
-
-        self._n_frames += 1
+        self._n_chirp += 1
 
     def range_fft(self):
-        assert self._n_frames >= self._buffer_size, "buffer not filled yet"
-        data = self._data - self._data.mean(axis=1, keepdims=True)
+        assert self.data_ready(), "buffer not filled yet"
+
+        window = self._data[self._n_chirp - self._window_size : self._n_chirp, :]
+        data = window - window.mean(axis=1, keepdims=True)
         data *= self._if_scale
         data *= self._window
         spec = np.fft.rfft(data, n=self._range_fft_size, axis=1)
@@ -69,7 +85,7 @@ class Pipeline:
         """Returns chest displacement in µm over the full slow-time window."""
         # iq, _bin = self.target_iq()
         # Poor-man's circle fit: center on the mean, skip scale normalization
-        """
+        
         iq, _ = self.target_iq()
         cx, cy, r = self._circle_fit_taubin(iq.real, iq.imag)
         iq = (iq - complex(cx, cy)) / r        # recenter + normalize to unit circle
@@ -77,21 +93,32 @@ class Pipeline:
         phase = np.concatenate(([0.0], np.cumsum(dphi)))
         # phase = np.unwrap(np.angle(iq))
         return phase * self._rad_to_um                   # µm
-        """
-    
-        iq, _ = self.target_iq()
-        iq = iq - iq.mean()
-        dphi = np.angle(iq[1:] * np.conj(iq[:-1]))
-        phase = np.concatenate(([0.0], np.cumsum(dphi)))
-        return phase * self._rad_to_um
+        
 
     def vitals(self):
-        """Returns (breath_um, heart_um) — same length as the slow-time buffer."""
+        """Returns (breath_um, heart_um) — streaming, so past samples never change."""
         d = self.displacement()
-        d = d - d.mean()                                  # pre-filter DC strip
-        breath = sosfiltfilt(self._sos_breath, d)
-        heart  = sosfiltfilt(self._sos_heart,  d)
-        return breath, heart
+        d = d - d.mean()
+
+        # Only the last `stride` chirps are truly new this call
+        new = d[-self._stride:]
+
+        # Seed filter state at the first call so startup doesn't produce a huge transient
+        if self._breath_zi is None:
+            self._breath_zi = sosfilt_zi(self._sos_breath) * new[0]
+            self._heart_zi  = sosfilt_zi(self._sos_heart)  * new[0]
+
+        b_new, self._breath_zi = sosfilt(self._sos_breath, new, zi=self._breath_zi)
+        h_new, self._heart_zi  = sosfilt(self._sos_heart,  new, zi=self._heart_zi)
+
+        # Shift history left, append the freshly filtered stride on the right
+        s = self._stride
+        self._filt_breath[:-s] = self._filt_breath[s:]
+        self._filt_heart [:-s] = self._filt_heart [s:]
+        self._filt_breath[-s:] = b_new
+        self._filt_heart [-s:] = h_new
+
+        return self._filt_breath, self._filt_heart
     
     def _circle_fit_taubin(self, x, y):
         mx, my = x.mean(), y.mean()
