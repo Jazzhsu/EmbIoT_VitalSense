@@ -62,8 +62,8 @@ static const USB_DEVICE_INFO usb_deviceInfo = {
     0x058B,                       /* VendorId    */
     0x027D,                       /* ProductId    */
     "Infineon Technologies",      /* VendorName   */
-    "CDC Code Example",           /* ProductName  */
-    "12345678"                    /* SerialNumber */
+    "Vital Sense Serial",         /* ProductName  */
+    "2439"                        /* SerialNumber */
 };
 
 

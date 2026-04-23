@@ -1,7 +1,5 @@
-import serial
-import struct
+import argparse
 import threading
-import time
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,9 +7,17 @@ import numpy as np
 from processor import Processor, SAMPLE_PER_CHIRP, CHIRP_PER_FRAME
 
 def main():
+    parser = argparse.ArgumentParser(description="Vital Sense Host")
+
+    # 2. Add arguments
+    parser.add_argument("-s", "--serial", help="serial port")
+    
+    # 3. Parse arguments
+    args = parser.parse_args()
+
     lock = threading.Lock()
     result = {"mag": None, "breath": None, "heart": None}
-    proc = Processor(result, lock)
+    proc = Processor(result, lock, args.serial)
 
     threading.Thread(target=proc.worker, daemon=True).start()
 
