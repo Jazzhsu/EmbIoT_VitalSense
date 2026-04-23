@@ -126,7 +126,7 @@ int main(void) {
     cyhal_gpio_init(CYBSP_USER_LED, CYHAL_GPIO_DIR_OUTPUT, CYHAL_GPIO_DRIVE_STRONG, CYBSP_LED_STATE_OFF);
 
     printf("\x1b[2J\x1b[;H");
-    printf("****************** emUSB Device: CDC echo application ****************** \r\n\n");
+    printf("****************** Vital Sense Application ****************** \r\n\n");
 
     USBD_Init();
     usb_add_cdc();
